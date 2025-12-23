@@ -17,7 +17,6 @@ database.sqlite
 .env.production
 !.env.example
 
-package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
