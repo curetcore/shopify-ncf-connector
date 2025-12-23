@@ -53,7 +53,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // Redirigir a NCF Manager
   const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
 
-  return redirect(`${ncfManagerUrl}/auth/shopify?shop=${encodeURIComponent(shopDomain)}`);
+  return redirect(`${ncfManagerUrl}/api/auth/shopify?shop=${encodeURIComponent(shopDomain)}`);
 };
 
 // Página de loading mientras redirige
