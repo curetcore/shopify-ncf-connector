@@ -1,0 +1,60 @@
+// NCF Manager - Shopify Connector
+// Schema de base de datos
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Sesiones de Shopify (requerido por @shopify/shopify-app-session-storage-prisma)
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+
+  @@index([shop])
+}
+
+// Registro de tiendas que han instalado la app
+model Shop {
+  id              String    @id @default(cuid())
+  shopDomain      String    @unique  // mitienda.myshopify.com
+  shopName        String?
+  email           String?
+
+  // Estado de la instalación
+  isActive        Boolean   @default(true)
+  installedAt     DateTime  @default(now())
+  uninstalledAt   DateTime?
+
+  // Billing (para el sistema freemium)
+  plan            String    @default("free")  // free | pro
+  invoicesThisMonth Int     @default(0)
+  monthlyLimit    Int       @default(50)
+  billingCycleStart DateTime @default(now())
+
+  // Metadata
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([shopDomain])
+  @@index([isActive])
+}

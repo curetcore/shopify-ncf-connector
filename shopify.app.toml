@@ -1,0 +1,43 @@
+# NCF Manager - Shopify Connector
+# Esta app conecta tiendas Shopify con NCF Manager
+
+name = "NCF Manager"
+client_id = "e020ddb69dd69689d51d744cdc83a461"
+application_url = "https://ncf-connector.curetcore.com"
+embedded = false
+
+[build]
+automatically_update_urls_on_dev = true
+dev_store_url = ""
+
+[auth]
+redirect_urls = [
+  "https://ncf-connector.curetcore.com/auth/callback",
+  "http://localhost:3000/auth/callback"
+]
+
+[access_scopes]
+scopes = "read_orders,read_customers,read_products"
+
+[webhooks]
+api_version = "2025-01"
+
+[[webhooks.subscriptions]]
+topics = ["app/uninstalled"]
+uri = "/webhooks/app/uninstalled"
+
+# Compliance webhooks (requeridos para App Store)
+[[webhooks.subscriptions]]
+topics = ["customers/data_request"]
+uri = "/webhooks/customers/data_request"
+
+[[webhooks.subscriptions]]
+topics = ["customers/redact"]
+uri = "/webhooks/customers/redact"
+
+[[webhooks.subscriptions]]
+topics = ["shop/redact"]
+uri = "/webhooks/shop/redact"
+
+[pos]
+embedded = false
