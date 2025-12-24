@@ -8,9 +8,12 @@ import styles from "./styles.module.css";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
+  const shop = url.searchParams.get("shop");
 
-  if (url.searchParams.get("shop")) {
-    throw redirect(`/app?${url.searchParams.toString()}`);
+  // Si viene con shop, iniciar el flujo de OAuth
+  if (shop) {
+    // Redirigir a auth/login para iniciar OAuth correctamente
+    throw redirect(`/auth/login?shop=${encodeURIComponent(shop)}`);
   }
 
   return { showForm: Boolean(login) };
