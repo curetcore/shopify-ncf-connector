@@ -9,10 +9,15 @@ import styles from "./styles.module.css";
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const url = new URL(request.url);
   const shop = url.searchParams.get("shop");
+  const host = url.searchParams.get("host");
 
-  // Si viene con shop, iniciar el flujo de OAuth
+  // Si viene con shop Y host, es un redirect post-OAuth - ir a /app
+  if (shop && host) {
+    throw redirect(`/app?${url.searchParams.toString()}`);
+  }
+
+  // Si solo viene con shop (instalación nueva), iniciar OAuth
   if (shop) {
-    // Redirigir a auth/login para iniciar OAuth correctamente
     throw redirect(`/auth/login?shop=${encodeURIComponent(shop)}`);
   }
 
