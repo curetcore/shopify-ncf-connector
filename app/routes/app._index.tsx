@@ -27,8 +27,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const shopDomain = session.shop;
   const accessToken = session.accessToken;
 
-  // Sincronizar token con NCF Manager (en background)
   const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
+
+  // Sincronizar token con NCF Manager (en background)
   fetch(`${ncfManagerUrl}/api/webhooks/shopify/token-sync`, {
     method: "POST",
     headers: {
@@ -41,6 +42,30 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }).catch((err) => {
     console.error("Error sincronizando token con NCF Manager:", err);
   });
+
+  // Consultar plan centralizado desde NCF Manager
+  // Esto permite que si pagó en web (Stripe), se refleje aquí
+  let centralPlan = {
+    plan: "free" as string,
+    monthlyLimit: 10,
+    invoicesThisMonth: 0,
+    billingSource: null as string | null,
+    canUpgradeHere: true,
+    message: null as string | null,
+  };
+
+  try {
+    const planResponse = await fetch(`${ncfManagerUrl}/api/shop/plan`, {
+      headers: {
+        "X-Shopify-Shop": shopDomain,
+      },
+    });
+    if (planResponse.ok) {
+      centralPlan = await planResponse.json();
+    }
+  } catch (err) {
+    console.error("Error consultando plan desde NCF Manager:", err);
+  }
 
   // Obtener o crear Shop en la DB
   let shop = await prisma.shop.findUnique({
@@ -109,20 +134,24 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     customer: { displayName: string; email: string } | null;
   }}) => edge.node) || [];
 
-  // Calcular estadísticas
-  const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
-  const usagePercent = shop.monthlyLimit > 0
-    ? Math.round((shop.invoicesThisMonth / shop.monthlyLimit) * 100)
+  // Usar datos del plan centralizado (NCF Manager es la fuente de verdad)
+  const usagePercent = centralPlan.monthlyLimit > 0
+    ? Math.round((centralPlan.invoicesThisMonth / centralPlan.monthlyLimit) * 100)
     : 0;
 
   return json({
     shop: {
       domain: shopDomain,
       name: shop.shopName || shopDomain,
-      plan: shop.plan,
-      invoicesThisMonth: shop.invoicesThisMonth,
-      monthlyLimit: shop.monthlyLimit,
+      // Usar plan desde NCF Manager (refleja pagos de web/Stripe/Apple)
+      plan: centralPlan.plan,
+      invoicesThisMonth: centralPlan.invoicesThisMonth,
+      monthlyLimit: centralPlan.monthlyLimit,
       usagePercent,
+      // Info de billing para mostrar mensajes apropiados
+      billingSource: centralPlan.billingSource,
+      canUpgradeHere: centralPlan.canUpgradeHere,
+      billingMessage: centralPlan.message,
     },
     orders,
     ncfManagerUrl,
@@ -209,6 +238,12 @@ export default function Index() {
   const isPro = shop.plan === "pro";
   const isNearLimit = shop.usagePercent >= 80;
   const isAtLimit = shop.invoicesThisMonth >= shop.monthlyLimit;
+  // Info de billing centralizado
+  const billingSource = shop.billingSource;
+  const canUpgradeHere = shop.canUpgradeHere;
+  const billingMessage = shop.billingMessage;
+  // Si ya es Pro pero pagó en otra plataforma
+  const paidElsewhere = isPro && billingSource && billingSource !== "shopify";
 
   return (
     <Page title="NCF Manager">
@@ -380,8 +415,8 @@ export default function Index() {
               </BlockStack>
             </Card>
 
-            {/* Upgrade card */}
-            {!isPro && (
+            {/* Upgrade card - solo si no es Pro o si puede hacer upgrade aquí */}
+            {!isPro && canUpgradeHere && (
               <Box paddingBlockStart="500">
                 <Card>
                   <BlockStack gap="400">
@@ -410,6 +445,30 @@ export default function Index() {
                         Actualizar a Pro - $9/mes
                       </Button>
                     </Form>
+                  </BlockStack>
+                </Card>
+              </Box>
+            )}
+
+            {/* Mensaje si ya tiene Pro de otra plataforma */}
+            {paidElsewhere && (
+              <Box paddingBlockStart="500">
+                <Card>
+                  <BlockStack gap="300">
+                    <InlineStack gap="200" align="start">
+                      <Badge tone="success">Pro</Badge>
+                      <Text as="h2" variant="headingMd">
+                        Plan Activo
+                      </Text>
+                    </InlineStack>
+
+                    <Text as="p" variant="bodyMd" tone="subdued">
+                      {billingMessage || `Tu suscripción Pro está activa via ${billingSource === "stripe" ? "la web" : "App Store"}.`}
+                    </Text>
+
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      Puedes gestionar tu suscripción desde {billingSource === "stripe" ? "NCF Manager web" : "la App Store"}.
+                    </Text>
                   </BlockStack>
                 </Card>
               </Box>
