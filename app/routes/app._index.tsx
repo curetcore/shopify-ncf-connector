@@ -23,10 +23,14 @@ import { ExternalIcon, RefreshIcon } from "@shopify/polaris-icons";
 
 // Loader - Obtiene datos para el dashboard
 export const loader = async ({ request }: LoaderFunctionArgs) => {
+  console.log("=== Dashboard Loader: Iniciando ===");
   try {
+    console.log("Dashboard: Autenticando...");
     const { session, admin } = await authenticate.admin(request);
+    console.log("Dashboard: Autenticación exitosa");
     const shopDomain = session.shop;
     const accessToken = session.accessToken;
+    console.log("Dashboard: Shop:", shopDomain, "Token exists:", !!accessToken);
 
     const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
 
@@ -68,12 +72,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
 
     // Obtener o crear Shop en la DB local
+    console.log("Dashboard: Buscando shop en DB...");
     let shop = await prisma.shop.findUnique({
       where: { shopDomain },
     });
+    console.log("Dashboard: Shop encontrado:", !!shop);
 
     if (!shop) {
       // Obtener info de la tienda desde Shopify
+      console.log("Dashboard: Creando shop nuevo...");
       try {
         const response = await admin.graphql(`
           query {
@@ -111,6 +118,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }
 
     // Obtener órdenes recientes desde Shopify
+    console.log("Dashboard: Obteniendo órdenes...");
     let orders: Array<{
       id: string;
       name: string;
@@ -149,6 +157,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       `);
       const ordersData = await ordersResponse.json();
       orders = ordersData.data?.orders?.edges?.map((edge: { node: typeof orders[0] }) => edge.node) || [];
+      console.log("Dashboard: Órdenes obtenidas:", orders.length);
     } catch (err) {
       console.error("Error obteniendo órdenes:", err);
       // Continuar sin órdenes
@@ -159,6 +168,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       ? Math.round((centralPlan.invoicesThisMonth / centralPlan.monthlyLimit) * 100)
       : 0;
 
+    console.log("Dashboard: Retornando datos del loader");
     return json({
       shop: {
         domain: shopDomain,
