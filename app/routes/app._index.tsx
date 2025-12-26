@@ -1,157 +1,451 @@
-import type { LoaderFunctionArgs } from "@remix-run/node";
-import { redirect, json } from "@remix-run/node";
-import { useLoaderData } from "@remix-run/react";
+import type { LoaderFunctionArgs, ActionFunctionArgs } from "@remix-run/node";
+import { json } from "@remix-run/node";
+import { useLoaderData, useSubmit, useNavigation, Form } from "@remix-run/react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import {
+  Page,
+  Layout,
+  Card,
+  Text,
+  BlockStack,
+  InlineStack,
+  Badge,
+  Button,
+  Banner,
+  DataTable,
+  EmptyState,
+  Box,
+  ProgressBar,
+  Divider,
+} from "@shopify/polaris";
+import { ExternalIcon, RefreshIcon } from "@shopify/polaris-icons";
 
-// Esta es la página principal después del OAuth
-// Guarda el shop en la DB y redirige al merchant a NCF Manager
+// Loader - Obtiene datos para el dashboard
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  console.log("=== NCF Connector: Iniciando loader ===");
+  const { session, admin } = await authenticate.admin(request);
+  const shopDomain = session.shop;
+  const accessToken = session.accessToken;
 
-  try {
-    const { session, admin } = await authenticate.admin(request);
-    console.log("Autenticación exitosa para:", session.shop);
+  // Sincronizar token con NCF Manager (en background)
+  const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
+  fetch(`${ncfManagerUrl}/api/webhooks/shopify/token-sync`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      shop: shopDomain,
+      accessToken,
+    }),
+  }).catch((err) => {
+    console.error("Error sincronizando token con NCF Manager:", err);
+  });
 
-    const shopDomain = session.shop;
+  // Obtener o crear Shop en la DB
+  let shop = await prisma.shop.findUnique({
+    where: { shopDomain },
+  });
 
-    // Obtener información de la tienda desde Shopify
-    let shopName = shopDomain;
-    let shopEmail = null;
-
-    try {
-      const response = await admin.graphql(`
-        query {
-          shop {
-            name
-            email
-          }
+  if (!shop) {
+    // Obtener info de la tienda desde Shopify
+    const response = await admin.graphql(`
+      query {
+        shop {
+          name
+          email
         }
-      `);
-      const data = await response.json();
-      shopName = data.data?.shop?.name || shopDomain;
-      shopEmail = data.data?.shop?.email || null;
-      console.log("Datos de tienda obtenidos:", { shopName, shopEmail });
-    } catch (error) {
-      console.error("Error obteniendo datos de la tienda:", error);
-    }
+      }
+    `);
+    const data = await response.json();
+    const shopName = data.data?.shop?.name || shopDomain;
+    const shopEmail = data.data?.shop?.email || null;
 
-    // Guardar/actualizar el shop en nuestra DB
-    try {
-      await prisma.shop.upsert({
-        where: { shopDomain },
-        create: {
-          shopDomain,
-          shopName,
-          email: shopEmail,
-          isActive: true,
-          installedAt: new Date(),
-        },
-        update: {
-          shopName,
-          email: shopEmail,
-          isActive: true,
-          uninstalledAt: null,
-        },
-      });
-      console.log(`Shop guardado en DB: ${shopDomain}`);
-    } catch (dbError) {
-      console.error("Error guardando shop en DB:", dbError);
-      // Continuar aunque falle la DB - lo importante es redirigir
-    }
-
-    // Redirigir a NCF Manager
-    const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
-    const redirectUrl = `${ncfManagerUrl}/api/auth/shopify?shop=${encodeURIComponent(shopDomain)}`;
-
-    console.log("Redirigiendo a:", redirectUrl);
-
-    return redirect(redirectUrl);
-  } catch (error) {
-    console.error("Error en loader:", error);
-    // Devolver error para mostrarlo en la página
-    return json({
-      error: true,
-      message: error instanceof Error ? error.message : "Error desconocido",
-      ncfUrl: process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com"
+    shop = await prisma.shop.create({
+      data: {
+        shopDomain,
+        shopName,
+        email: shopEmail,
+        isActive: true,
+        installedAt: new Date(),
+      },
     });
   }
+
+  // Obtener órdenes recientes desde Shopify
+  const ordersResponse = await admin.graphql(`
+    query {
+      orders(first: 10, sortKey: CREATED_AT, reverse: true) {
+        edges {
+          node {
+            id
+            name
+            createdAt
+            displayFinancialStatus
+            displayFulfillmentStatus
+            totalPriceSet {
+              shopMoney {
+                amount
+                currencyCode
+              }
+            }
+            customer {
+              displayName
+              email
+            }
+          }
+        }
+      }
+    }
+  `);
+  const ordersData = await ordersResponse.json();
+  const orders = ordersData.data?.orders?.edges?.map((edge: { node: {
+    id: string;
+    name: string;
+    createdAt: string;
+    displayFinancialStatus: string;
+    displayFulfillmentStatus: string;
+    totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
+    customer: { displayName: string; email: string } | null;
+  }}) => edge.node) || [];
+
+  // Calcular estadísticas
+  const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
+  const usagePercent = shop.monthlyLimit > 0
+    ? Math.round((shop.invoicesThisMonth / shop.monthlyLimit) * 100)
+    : 0;
+
+  return json({
+    shop: {
+      domain: shopDomain,
+      name: shop.shopName || shopDomain,
+      plan: shop.plan,
+      invoicesThisMonth: shop.invoicesThisMonth,
+      monthlyLimit: shop.monthlyLimit,
+      usagePercent,
+    },
+    orders,
+    ncfManagerUrl,
+  });
 };
 
-// Página de loading o error
-export default function Index() {
-  const data = useLoaderData<typeof loader>();
+// Action - Manejar sincronización
+export const action = async ({ request }: ActionFunctionArgs) => {
+  const { session } = await authenticate.admin(request);
+  const shopDomain = session.shop;
 
-  // Si hay error, mostrarlo
-  if (data && 'error' in data && data.error) {
-    return (
-      <div style={{
-        display: 'flex',
-        flexDirection: 'column',
-        justifyContent: 'center',
-        alignItems: 'center',
-        height: '100vh',
-        fontFamily: 'system-ui, sans-serif',
-        backgroundColor: '#fef2f2',
-      }}>
-        <div style={{
-          backgroundColor: 'white',
-          padding: '2rem',
-          borderRadius: '8px',
-          boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
-          textAlign: 'center',
-          maxWidth: '400px',
-        }}>
-          <h1 style={{ margin: '0 0 1rem 0', fontSize: '1.5rem', color: '#dc2626' }}>
-            Error de Conexión
-          </h1>
-          <p style={{ margin: '0 0 1rem 0', color: '#6d7175' }}>
-            {data.message}
-          </p>
-          <a
-            href={data.ncfUrl}
-            style={{
-              display: 'inline-block',
-              padding: '0.75rem 1.5rem',
-              backgroundColor: '#2563eb',
-              color: 'white',
-              textDecoration: 'none',
-              borderRadius: '6px',
-              fontWeight: 500,
-            }}
-          >
-            Ir a NCF Manager
-          </a>
-        </div>
-      </div>
-    );
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  if (intent === "sync") {
+    // Llamar al endpoint de sincronización de NCF Manager
+    const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
+
+    try {
+      const response = await fetch(`${ncfManagerUrl}/api/orders/sync`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Shop": shopDomain,
+        },
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        return json({ success: true, message: data.message || "Sincronización completada" });
+      } else {
+        return json({ success: false, message: "Error al sincronizar" });
+      }
+    } catch {
+      return json({ success: false, message: "Error de conexión con NCF Manager" });
+    }
   }
 
-  // Loading normal
+  return json({ success: false, message: "Acción no reconocida" });
+};
+
+export default function Index() {
+  const { shop, orders, ncfManagerUrl } = useLoaderData<typeof loader>();
+  const submit = useSubmit();
+  const navigation = useNavigation();
+  const isSyncing = navigation.state === "submitting";
+
+  // Formatear fecha
+  const formatDate = (dateStr: string) => {
+    return new Date(dateStr).toLocaleDateString("es-DO", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    });
+  };
+
+  // Formatear precio
+  const formatPrice = (amount: string, currency: string) => {
+    return new Intl.NumberFormat("es-DO", {
+      style: "currency",
+      currency,
+    }).format(parseFloat(amount));
+  };
+
+  // Preparar filas para DataTable
+  const tableRows = orders.map((order: {
+    name: string;
+    createdAt: string;
+    customer: { displayName: string } | null;
+    displayFinancialStatus: string;
+    totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
+  }) => [
+    order.name,
+    formatDate(order.createdAt),
+    order.customer?.displayName || "Sin cliente",
+    order.displayFinancialStatus,
+    formatPrice(order.totalPriceSet.shopMoney.amount, order.totalPriceSet.shopMoney.currencyCode),
+  ]);
+
+  const handleSync = () => {
+    submit({ intent: "sync" }, { method: "post" });
+  };
+
+  const isPro = shop.plan === "pro";
+  const isNearLimit = shop.usagePercent >= 80;
+  const isAtLimit = shop.invoicesThisMonth >= shop.monthlyLimit;
+
   return (
-    <div style={{
-      display: 'flex',
-      flexDirection: 'column',
-      justifyContent: 'center',
-      alignItems: 'center',
-      height: '100vh',
-      fontFamily: 'system-ui, sans-serif',
-      backgroundColor: '#f6f6f7',
-    }}>
-      <div style={{
-        backgroundColor: 'white',
-        padding: '2rem',
-        borderRadius: '8px',
-        boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
-        textAlign: 'center',
-      }}>
-        <h1 style={{ margin: '0 0 1rem 0', fontSize: '1.5rem', color: '#202223' }}>
-          NCF Manager
-        </h1>
-        <p style={{ margin: 0, color: '#6d7175' }}>
-          Conectando con tu cuenta...
-        </p>
-      </div>
-    </div>
+    <Page title="NCF Manager">
+      <BlockStack gap="500">
+        {/* Banner de límite */}
+        {!isPro && isNearLimit && !isAtLimit && (
+          <Banner
+            title="Cerca del límite mensual"
+            tone="warning"
+          >
+            <p>
+              Has usado {shop.invoicesThisMonth} de {shop.monthlyLimit} comprobantes este mes.
+              Actualiza a Pro para comprobantes ilimitados.
+            </p>
+          </Banner>
+        )}
+
+        {!isPro && isAtLimit && (
+          <Banner
+            title="Límite mensual alcanzado"
+            tone="critical"
+          >
+            <p>
+              Has alcanzado el límite de {shop.monthlyLimit} comprobantes mensuales.
+              Actualiza a Pro ($9/mes) para continuar generando comprobantes.
+            </p>
+          </Banner>
+        )}
+
+        <Layout>
+          {/* Columna principal */}
+          <Layout.Section>
+            {/* Stats Cards */}
+            <Card>
+              <BlockStack gap="400">
+                <InlineStack align="space-between">
+                  <Text as="h2" variant="headingMd">
+                    Resumen
+                  </Text>
+                  <Badge tone={isPro ? "success" : "info"}>
+                    {isPro ? "Pro" : "Gratis"}
+                  </Badge>
+                </InlineStack>
+
+                <Divider />
+
+                <InlineStack gap="800" align="start" blockAlign="start">
+                  <BlockStack gap="100">
+                    <Text as="p" variant="bodyMd" tone="subdued">
+                      Comprobantes este mes
+                    </Text>
+                    <Text as="p" variant="headingXl">
+                      {shop.invoicesThisMonth}
+                    </Text>
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      de {shop.monthlyLimit} {isPro ? "(ilimitado)" : ""}
+                    </Text>
+                  </BlockStack>
+
+                  <BlockStack gap="100">
+                    <Text as="p" variant="bodyMd" tone="subdued">
+                      Órdenes recientes
+                    </Text>
+                    <Text as="p" variant="headingXl">
+                      {orders.length}
+                    </Text>
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      últimas 10
+                    </Text>
+                  </BlockStack>
+                </InlineStack>
+
+                {!isPro && (
+                  <Box>
+                    <BlockStack gap="200">
+                      <InlineStack align="space-between">
+                        <Text as="span" variant="bodySm">
+                          Uso mensual
+                        </Text>
+                        <Text as="span" variant="bodySm">
+                          {shop.usagePercent}%
+                        </Text>
+                      </InlineStack>
+                      <ProgressBar
+                        progress={shop.usagePercent}
+                        tone={isNearLimit ? "critical" : "primary"}
+                        size="small"
+                      />
+                    </BlockStack>
+                  </Box>
+                )}
+              </BlockStack>
+            </Card>
+
+            {/* Órdenes recientes */}
+            <Box paddingBlockStart="500">
+              <Card>
+                <BlockStack gap="400">
+                  <InlineStack align="space-between">
+                    <Text as="h2" variant="headingMd">
+                      Órdenes Recientes
+                    </Text>
+                    <Button
+                      onClick={handleSync}
+                      loading={isSyncing}
+                      icon={RefreshIcon}
+                      size="slim"
+                    >
+                      Sincronizar
+                    </Button>
+                  </InlineStack>
+
+                  {orders.length > 0 ? (
+                    <DataTable
+                      columnContentTypes={["text", "text", "text", "text", "numeric"]}
+                      headings={["Orden", "Fecha", "Cliente", "Estado", "Total"]}
+                      rows={tableRows}
+                    />
+                  ) : (
+                    <EmptyState
+                      heading="Sin órdenes"
+                      image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
+                    >
+                      <p>Las órdenes de tu tienda aparecerán aquí.</p>
+                    </EmptyState>
+                  )}
+                </BlockStack>
+              </Card>
+            </Box>
+          </Layout.Section>
+
+          {/* Sidebar */}
+          <Layout.Section variant="oneThird">
+            {/* Acciones rápidas */}
+            <Card>
+              <BlockStack gap="400">
+                <Text as="h2" variant="headingMd">
+                  Acciones
+                </Text>
+
+                <BlockStack gap="300">
+                  <Button
+                    url={ncfManagerUrl}
+                    external
+                    icon={ExternalIcon}
+                    fullWidth
+                  >
+                    Abrir NCF Manager
+                  </Button>
+
+                  <Button
+                    url={`${ncfManagerUrl}/ordenes/nueva`}
+                    external
+                    variant="plain"
+                    fullWidth
+                  >
+                    Crear orden manual
+                  </Button>
+
+                  <Button
+                    url={`${ncfManagerUrl}/solicitudes`}
+                    external
+                    variant="plain"
+                    fullWidth
+                  >
+                    Ver solicitudes
+                  </Button>
+                </BlockStack>
+              </BlockStack>
+            </Card>
+
+            {/* Upgrade card */}
+            {!isPro && (
+              <Box paddingBlockStart="500">
+                <Card>
+                  <BlockStack gap="400">
+                    <Text as="h2" variant="headingMd">
+                      Actualiza a Pro
+                    </Text>
+
+                    <Text as="p" variant="bodyMd" tone="subdued">
+                      Obtén comprobantes ilimitados por solo $9/mes.
+                    </Text>
+
+                    <BlockStack gap="200">
+                      <Text as="p" variant="bodySm">
+                        ✓ Comprobantes ilimitados
+                      </Text>
+                      <Text as="p" variant="bodySm">
+                        ✓ Sincronización automática
+                      </Text>
+                      <Text as="p" variant="bodySm">
+                        ✓ Soporte prioritario
+                      </Text>
+                    </BlockStack>
+
+                    <Form method="post" action="/app/billing">
+                      <Button variant="primary" fullWidth submit>
+                        Actualizar a Pro - $9/mes
+                      </Button>
+                    </Form>
+                  </BlockStack>
+                </Card>
+              </Box>
+            )}
+
+            {/* Info de tienda */}
+            <Box paddingBlockStart="500">
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Tu tienda
+                  </Text>
+
+                  <BlockStack gap="100">
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      Nombre
+                    </Text>
+                    <Text as="p" variant="bodyMd">
+                      {shop.name}
+                    </Text>
+                  </BlockStack>
+
+                  <BlockStack gap="100">
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      Dominio
+                    </Text>
+                    <Text as="p" variant="bodyMd">
+                      {shop.domain}
+                    </Text>
+                  </BlockStack>
+                </BlockStack>
+              </Card>
+            </Box>
+          </Layout.Section>
+        </Layout>
+      </BlockStack>
+    </Page>
   );
 }
