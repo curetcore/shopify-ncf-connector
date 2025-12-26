@@ -23,139 +23,161 @@ import { ExternalIcon, RefreshIcon } from "@shopify/polaris-icons";
 
 // Loader - Obtiene datos para el dashboard
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session, admin } = await authenticate.admin(request);
-  const shopDomain = session.shop;
-  const accessToken = session.accessToken;
-
-  const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
-
-  // Sincronizar token con NCF Manager (en background)
-  fetch(`${ncfManagerUrl}/api/webhooks/shopify/token-sync`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      shop: shopDomain,
-      accessToken,
-    }),
-  }).catch((err) => {
-    console.error("Error sincronizando token con NCF Manager:", err);
-  });
-
-  // Consultar plan centralizado desde NCF Manager
-  // Esto permite que si pagó en web (Stripe), se refleje aquí
-  let centralPlan = {
-    plan: "free" as string,
-    monthlyLimit: 10,
-    invoicesThisMonth: 0,
-    billingSource: null as string | null,
-    canUpgradeHere: true,
-    message: null as string | null,
-  };
-
   try {
-    const planResponse = await fetch(`${ncfManagerUrl}/api/shop/plan`, {
+    const { session, admin } = await authenticate.admin(request);
+    const shopDomain = session.shop;
+    const accessToken = session.accessToken;
+
+    const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
+
+    // Sincronizar token con NCF Manager (en background)
+    fetch(`${ncfManagerUrl}/api/webhooks/shopify/token-sync`, {
+      method: "POST",
       headers: {
-        "X-Shopify-Shop": shopDomain,
+        "Content-Type": "application/json",
       },
+      body: JSON.stringify({
+        shop: shopDomain,
+        accessToken,
+      }),
+    }).catch((err) => {
+      console.error("Error sincronizando token con NCF Manager:", err);
     });
-    if (planResponse.ok) {
-      centralPlan = await planResponse.json();
-    }
-  } catch (err) {
-    console.error("Error consultando plan desde NCF Manager:", err);
-  }
 
-  // Obtener o crear Shop en la DB
-  let shop = await prisma.shop.findUnique({
-    where: { shopDomain },
-  });
+    // Consultar plan centralizado desde NCF Manager
+    let centralPlan = {
+      plan: "free" as string,
+      monthlyLimit: 10,
+      invoicesThisMonth: 0,
+      billingSource: null as string | null,
+      canUpgradeHere: true,
+      message: null as string | null,
+    };
 
-  if (!shop) {
-    // Obtener info de la tienda desde Shopify
-    const response = await admin.graphql(`
-      query {
-        shop {
-          name
-          email
-        }
+    try {
+      const planResponse = await fetch(`${ncfManagerUrl}/api/shop/plan`, {
+        headers: {
+          "X-Shopify-Shop": shopDomain,
+        },
+      });
+      if (planResponse.ok) {
+        centralPlan = await planResponse.json();
       }
-    `);
-    const data = await response.json();
-    const shopName = data.data?.shop?.name || shopDomain;
-    const shopEmail = data.data?.shop?.email || null;
+    } catch (err) {
+      console.error("Error consultando plan desde NCF Manager:", err);
+    }
 
-    shop = await prisma.shop.create({
-      data: {
-        shopDomain,
-        shopName,
-        email: shopEmail,
-        isActive: true,
-        installedAt: new Date(),
-      },
+    // Obtener o crear Shop en la DB local
+    let shop = await prisma.shop.findUnique({
+      where: { shopDomain },
     });
-  }
 
-  // Obtener órdenes recientes desde Shopify
-  const ordersResponse = await admin.graphql(`
-    query {
-      orders(first: 10, sortKey: CREATED_AT, reverse: true) {
-        edges {
-          node {
-            id
-            name
-            createdAt
-            displayFinancialStatus
-            displayFulfillmentStatus
-            totalPriceSet {
-              shopMoney {
-                amount
-                currencyCode
-              }
-            }
-            customer {
-              displayName
+    if (!shop) {
+      // Obtener info de la tienda desde Shopify
+      try {
+        const response = await admin.graphql(`
+          query {
+            shop {
+              name
               email
             }
           }
-        }
+        `);
+        const data = await response.json();
+        const shopName = data.data?.shop?.name || shopDomain;
+        const shopEmail = data.data?.shop?.email || null;
+
+        shop = await prisma.shop.create({
+          data: {
+            shopDomain,
+            shopName,
+            email: shopEmail,
+            isActive: true,
+            installedAt: new Date(),
+          },
+        });
+      } catch (err) {
+        console.error("Error creando shop en DB:", err);
+        // Crear shop con datos mínimos
+        shop = await prisma.shop.create({
+          data: {
+            shopDomain,
+            shopName: shopDomain,
+            isActive: true,
+            installedAt: new Date(),
+          },
+        });
       }
     }
-  `);
-  const ordersData = await ordersResponse.json();
-  const orders = ordersData.data?.orders?.edges?.map((edge: { node: {
-    id: string;
-    name: string;
-    createdAt: string;
-    displayFinancialStatus: string;
-    displayFulfillmentStatus: string;
-    totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
-    customer: { displayName: string; email: string } | null;
-  }}) => edge.node) || [];
 
-  // Usar datos del plan centralizado (NCF Manager es la fuente de verdad)
-  const usagePercent = centralPlan.monthlyLimit > 0
-    ? Math.round((centralPlan.invoicesThisMonth / centralPlan.monthlyLimit) * 100)
-    : 0;
+    // Obtener órdenes recientes desde Shopify
+    let orders: Array<{
+      id: string;
+      name: string;
+      createdAt: string;
+      displayFinancialStatus: string;
+      displayFulfillmentStatus: string;
+      totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
+      customer: { displayName: string; email: string } | null;
+    }> = [];
 
-  return json({
-    shop: {
-      domain: shopDomain,
-      name: shop.shopName || shopDomain,
-      // Usar plan desde NCF Manager (refleja pagos de web/Stripe/Apple)
-      plan: centralPlan.plan,
-      invoicesThisMonth: centralPlan.invoicesThisMonth,
-      monthlyLimit: centralPlan.monthlyLimit,
-      usagePercent,
-      // Info de billing para mostrar mensajes apropiados
-      billingSource: centralPlan.billingSource,
-      canUpgradeHere: centralPlan.canUpgradeHere,
-      billingMessage: centralPlan.message,
-    },
-    orders,
-    ncfManagerUrl,
-  });
+    try {
+      const ordersResponse = await admin.graphql(`
+        query {
+          orders(first: 10, sortKey: CREATED_AT, reverse: true) {
+            edges {
+              node {
+                id
+                name
+                createdAt
+                displayFinancialStatus
+                displayFulfillmentStatus
+                totalPriceSet {
+                  shopMoney {
+                    amount
+                    currencyCode
+                  }
+                }
+                customer {
+                  displayName
+                  email
+                }
+              }
+            }
+          }
+        }
+      `);
+      const ordersData = await ordersResponse.json();
+      orders = ordersData.data?.orders?.edges?.map((edge: { node: typeof orders[0] }) => edge.node) || [];
+    } catch (err) {
+      console.error("Error obteniendo órdenes:", err);
+      // Continuar sin órdenes
+    }
+
+    // Usar datos del plan centralizado (NCF Manager es la fuente de verdad)
+    const usagePercent = centralPlan.monthlyLimit > 0
+      ? Math.round((centralPlan.invoicesThisMonth / centralPlan.monthlyLimit) * 100)
+      : 0;
+
+    return json({
+      shop: {
+        domain: shopDomain,
+        name: shop.shopName || shopDomain,
+        plan: centralPlan.plan,
+        invoicesThisMonth: centralPlan.invoicesThisMonth,
+        monthlyLimit: centralPlan.monthlyLimit,
+        usagePercent,
+        billingSource: centralPlan.billingSource,
+        canUpgradeHere: centralPlan.canUpgradeHere,
+        billingMessage: centralPlan.message,
+      },
+      orders,
+      ncfManagerUrl,
+    });
+  } catch (err) {
+    console.error("Error fatal en loader:", err);
+    throw err;
+  }
 };
 
 // Action - Manejar sincronización
