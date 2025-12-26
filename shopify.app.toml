@@ -13,6 +13,7 @@ dev_store_url = ""
 [auth]
 redirect_urls = [
   "https://ncf-connector.curetcore.com/auth/callback",
+  "https://ncf.curetcore.com/api/auth/shopify/callback",
   "http://localhost:3000/auth/callback"
 ]
 
@@ -25,19 +26,6 @@ api_version = "2025-01"
 [[webhooks.subscriptions]]
 topics = ["app/uninstalled"]
 uri = "/webhooks/app/uninstalled"
-
-# Compliance webhooks (requeridos para App Store)
-[[webhooks.subscriptions]]
-topics = ["customers/data_request"]
-uri = "/webhooks/customers/data_request"
-
-[[webhooks.subscriptions]]
-topics = ["customers/redact"]
-uri = "/webhooks/customers/redact"
-
-[[webhooks.subscriptions]]
-topics = ["shop/redact"]
-uri = "/webhooks/shop/redact"
 
 [pos]
 embedded = false
