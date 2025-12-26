@@ -2,10 +2,11 @@
 
 ## Descripción General
 
-Conector OAuth para integrar tiendas Shopify con NCF Manager. Esta app minimalista:
-1. Autentica tiendas Shopify via OAuth
-2. Guarda el access token y datos de la tienda
-3. Redirige al merchant a NCF Manager
+App embebida de Shopify para gestión de comprobantes fiscales (NCF). Incluye:
+1. Dashboard completo dentro de Shopify Admin
+2. Visualización de órdenes recientes
+3. Sincronización de token con NCF Manager
+4. Billing integrado via Shopify Billing API ($9/mes)
 
 ## Stack Tecnológico
 
@@ -15,6 +16,9 @@ Conector OAuth para integrar tiendas Shopify con NCF Manager. Esta app minimalis
 | Prisma | 6.x | ORM |
 | PostgreSQL | - | Base de datos |
 | @shopify/shopify-app-remix | 4.x | OAuth y sesiones |
+| @shopify/polaris | 12.x | UI components |
+| @shopify/polaris-icons | - | Iconos |
+| @shopify/app-bridge-react | 4.x | Comunicación con Shopify |
 
 ## Estructura de Carpetas
 
@@ -22,19 +26,31 @@ Conector OAuth para integrar tiendas Shopify con NCF Manager. Esta app minimalis
 shopify-ncf-connector/
 ├── app/
 │   ├── routes/
-│   │   ├── app._index.tsx          # Página principal (redirige a NCF Manager)
-│   │   ├── app.tsx                 # Layout
+│   │   ├── app._index.tsx          # Dashboard principal con Polaris
+│   │   ├── app.tsx                 # Layout con AppProvider
+│   │   ├── app.billing.tsx         # Crear suscripción Pro
+│   │   ├── app.billing.callback.tsx # Callback de billing
 │   │   ├── auth.$.tsx              # OAuth callback
 │   │   ├── webhooks.*.tsx          # Webhooks de Shopify
 │   │   └── _index/                 # Landing page
-│   ├── shopify.server.ts           # Config de Shopify
+│   ├── shopify.server.ts           # Config de Shopify (isEmbeddedApp: true)
 │   └── db.server.ts                # Cliente Prisma
 ├── prisma/
 │   └── schema.prisma               # Modelos de datos
-├── shopify.app.toml                # Configuración de la app
+├── shopify.app.toml                # Configuración (embedded = true)
 ├── Dockerfile                      # Deploy
 └── .env                            # Variables de entorno
 ```
+
+## Dashboard (app._index.tsx)
+
+El dashboard embebido incluye:
+- **Resumen**: Stats de comprobantes y órdenes
+- **Barra de progreso**: Uso mensual del plan gratuito
+- **Tabla de órdenes**: Últimas 10 órdenes de Shopify
+- **Acciones**: Links a NCF Manager completo
+- **Upgrade**: Card para actualizar a Pro ($9/mes)
+- **Info de tienda**: Nombre y dominio
 
 ## Modelos de Base de Datos
 
@@ -45,25 +61,40 @@ shopify-ncf-connector/
 ### Shop
 - Registro de tiendas que han instalado la app
 - Tracking de billing y uso
+- Campos: plan, monthlyLimit, invoicesThisMonth, shopifyChargeId
 
 ## Flujo de Instalación
 
 ```
-1. Merchant encuentra app en Shopify App Store
-2. Click "Instalar" → Shopify redirige a /auth
-3. OAuth completa → Token guardado en Session
-4. Redirige a /app → Guarda Shop en DB
-5. Redirige a NCF Manager con ?shop=dominio
+1. Merchant instala desde Shopify App Store
+2. OAuth completa → Token guardado en Session
+3. Dashboard se muestra embebido en Shopify Admin
+4. Token sincronizado con NCF Manager
+5. Merchant puede usar la app o ir a NCF Manager completo
 ```
+
+## Shopify Billing
+
+| Archivo | Descripción |
+|---------|-------------|
+| app.billing.tsx | Crea suscripción recurrente ($9/mes) |
+| app.billing.callback.tsx | Maneja respuesta de aceptar/rechazar |
+
+Flujo:
+1. Click "Actualizar a Pro" → POST /app/billing
+2. Shopify muestra pantalla de confirmación
+3. Callback a /app/billing/callback
+4. Si acepta → Plan actualizado a Pro, límite = ilimitado
 
 ## Webhooks
 
 | Topic | Archivo | Descripción |
 |-------|---------|-------------|
 | app/uninstalled | webhooks.app.uninstalled.tsx | Marca shop como inactivo |
-| customers/data_request | webhooks.customers.data_request.tsx | GDPR: solicitud de datos |
-| customers/redact | webhooks.customers.redact.tsx | GDPR: eliminar datos cliente |
-| shop/redact | webhooks.shop.redact.tsx | GDPR: eliminar datos tienda |
+| orders/create | webhooks.orders.create.tsx | (Pendiente aprobación) |
+| orders/updated | webhooks.orders.updated.tsx | (Pendiente aprobación) |
+
+**Nota**: Los webhooks de órdenes requieren aprobación de "Protected Customer Data" por Shopify.
 
 ## Variables de Entorno
 
@@ -82,6 +113,7 @@ NCF_MANAGER_URL=           # URL de NCF Manager (https://ncf.curetcore.com)
 npm run dev           # Desarrollo con Shopify CLI
 npm run build         # Build de producción
 npm run start         # Arrancar producción
+npm run deploy        # Deploy configuración a Shopify
 npx prisma migrate dev  # Crear migración
 npx prisma studio     # UI de base de datos
 ```
@@ -92,8 +124,20 @@ El deploy es automático via Easypanel al hacer push a main.
 
 **Dominio**: ncf-connector.curetcore.com
 
+Para actualizar la configuración de la app en Shopify:
+```bash
+shopify app deploy --force
+```
+
+## Sincronización con NCF Manager
+
+El token de Shopify se sincroniza automáticamente cuando el merchant accede al dashboard:
+- Endpoint: `NCF_MANAGER_URL/api/webhooks/shopify/token-sync`
+- Permite a NCF Manager hacer queries a Shopify en nombre de la tienda
+
 ## Notas
 
-- La app NO es embebida (embedded = false)
-- Toda la funcionalidad de NCF está en NCF Manager, no aquí
-- Esta app solo maneja OAuth y sincronización
+- La app ES embebida (embedded = true)
+- Dashboard completo dentro de Shopify Admin
+- Billing via Shopify, no Stripe
+- Links externos abren NCF Manager para funcionalidades avanzadas
