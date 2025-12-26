@@ -1,6 +1,7 @@
 import type { LoaderFunctionArgs, ActionFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import { useLoaderData, useSubmit, useNavigation, Form } from "@remix-run/react";
+import { useLoaderData, useSubmit, useNavigation, Form, useActionData } from "@remix-run/react";
+import { useEffect, useCallback, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import {
@@ -13,40 +14,44 @@ import {
   Badge,
   Button,
   Banner,
-  DataTable,
   EmptyState,
   Box,
   ProgressBar,
   Divider,
+  IndexTable,
+  useIndexResourceState,
+  Tabs,
+  Modal,
+  TextField,
+  FormLayout,
+  Select,
+  Spinner,
 } from "@shopify/polaris";
-import { ExternalIcon, RefreshIcon } from "@shopify/polaris-icons";
+import { ExternalIcon, RefreshIcon, PlusIcon } from "@shopify/polaris-icons";
+
+// Tipos de NCF
+const NCF_TYPES = [
+  { label: "Consumidor Final (B02)", value: "B02" },
+  { label: "Crédito Fiscal (B01)", value: "B01" },
+  { label: "Gubernamental (B15)", value: "B15" },
+  { label: "Régimen Especial (B14)", value: "B14" },
+];
 
 // Loader - Obtiene datos para el dashboard
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  console.log("=== Dashboard Loader: Iniciando ===");
   try {
-    console.log("Dashboard: Autenticando...");
     const { session, admin } = await authenticate.admin(request);
-    console.log("Dashboard: Autenticación exitosa");
     const shopDomain = session.shop;
     const accessToken = session.accessToken;
-    console.log("Dashboard: Shop:", shopDomain, "Token exists:", !!accessToken);
 
     const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
 
     // Sincronizar token con NCF Manager (en background)
     fetch(`${ncfManagerUrl}/api/webhooks/shopify/token-sync`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        shop: shopDomain,
-        accessToken,
-      }),
-    }).catch((err) => {
-      console.error("Error sincronizando token con NCF Manager:", err);
-    });
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ shop: shopDomain, accessToken }),
+    }).catch(() => {});
 
     // Consultar plan centralizado desde NCF Manager
     let centralPlan = {
@@ -60,65 +65,37 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
     try {
       const planResponse = await fetch(`${ncfManagerUrl}/api/shop/plan`, {
-        headers: {
-          "X-Shopify-Shop": shopDomain,
-        },
+        headers: { "X-Shopify-Shop": shopDomain },
       });
       if (planResponse.ok) {
         centralPlan = await planResponse.json();
       }
-    } catch (err) {
-      console.error("Error consultando plan desde NCF Manager:", err);
-    }
+    } catch {}
 
     // Obtener o crear Shop en la DB local
-    console.log("Dashboard: Buscando shop en DB...");
-    let shop = await prisma.shop.findUnique({
-      where: { shopDomain },
-    });
-    console.log("Dashboard: Shop encontrado:", !!shop);
+    let shop = await prisma.shop.findUnique({ where: { shopDomain } });
 
     if (!shop) {
-      // Obtener info de la tienda desde Shopify
-      console.log("Dashboard: Creando shop nuevo...");
       try {
-        const response = await admin.graphql(`
-          query {
-            shop {
-              name
-              email
-            }
-          }
-        `);
+        const response = await admin.graphql(`query { shop { name email } }`);
         const data = await response.json();
-        const shopName = data.data?.shop?.name || shopDomain;
-        const shopEmail = data.data?.shop?.email || null;
-
         shop = await prisma.shop.create({
           data: {
             shopDomain,
-            shopName,
-            email: shopEmail,
+            shopName: data.data?.shop?.name || shopDomain,
+            email: data.data?.shop?.email || null,
             isActive: true,
             installedAt: new Date(),
           },
         });
-      } catch (err) {
-        console.error("Error creando shop en DB:", err);
-        // Crear shop con datos mínimos
+      } catch {
         shop = await prisma.shop.create({
-          data: {
-            shopDomain,
-            shopName: shopDomain,
-            isActive: true,
-            installedAt: new Date(),
-          },
+          data: { shopDomain, shopName: shopDomain, isActive: true, installedAt: new Date() },
         });
       }
     }
 
-    // Obtener órdenes desde NCF Manager (tiene el token guardado)
-    console.log("Dashboard: Obteniendo órdenes desde NCF Manager...");
+    // Obtener órdenes desde NCF Manager
     let orders: Array<{
       id: string;
       orderNumber: string;
@@ -127,39 +104,30 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       total: number;
       orderDate: string;
       source: string;
-      request?: { status: string } | null;
+      request?: { id: string; status: string; ncfId: string | null } | null;
     }> = [];
     let ordersError = false;
+    let ordersStats = { total: 0, withNCF: 0, pendingNCF: 0 };
 
     try {
-      const ordersResponse = await fetch(`${ncfManagerUrl}/api/shopify/orders?limit=10`, {
-        headers: {
-          "X-Shopify-Shop": shopDomain,
-        },
+      const ordersResponse = await fetch(`${ncfManagerUrl}/api/shopify/orders?limit=50`, {
+        headers: { "X-Shopify-Shop": shopDomain },
       });
       if (ordersResponse.ok) {
         const ordersData = await ordersResponse.json();
         orders = ordersData.orders || [];
-        console.log("Dashboard: Órdenes obtenidas:", orders.length);
-      } else if (ordersResponse.status === 404) {
-        // Shop no tiene órdenes aún - necesita sincronizar
-        console.log("Dashboard: No hay órdenes - necesita sincronizar");
-        ordersError = true;
+        ordersStats = ordersData.stats || ordersStats;
       } else {
-        console.error("Error obteniendo órdenes: Status", ordersResponse.status);
         ordersError = true;
       }
-    } catch (err) {
-      console.error("Error obteniendo órdenes:", err);
+    } catch {
       ordersError = true;
     }
 
-    // Usar datos del plan centralizado (NCF Manager es la fuente de verdad)
     const usagePercent = centralPlan.monthlyLimit > 0
       ? Math.round((centralPlan.invoicesThisMonth / centralPlan.monthlyLimit) * 100)
       : 0;
 
-    console.log("Dashboard: Retornando datos del loader");
     return json({
       shop: {
         domain: shopDomain,
@@ -174,6 +142,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       },
       orders,
       ordersError,
+      ordersStats,
       ncfManagerUrl,
     });
   } catch (err) {
@@ -182,36 +151,52 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }
 };
 
-// Action - Manejar sincronización
+// Action - Manejar sincronización y creación de NCF
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shopDomain = session.shop;
-
   const formData = await request.formData();
   const intent = formData.get("intent");
+  const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
 
   if (intent === "sync") {
-    // Llamar al endpoint de sincronización de NCF Manager
-    const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
-
     try {
       const response = await fetch(`${ncfManagerUrl}/api/shopify/orders`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Shopify-Shop": shopDomain,
-        },
+        headers: { "Content-Type": "application/json", "X-Shopify-Shop": shopDomain },
       });
-
       if (response.ok) {
         const data = await response.json();
-        return json({ success: true, message: data.message || "Sincronización completada" });
+        return json({ success: true, intent: "sync", message: data.message || "Sincronización completada" });
       } else {
         const errorData = await response.json().catch(() => ({}));
-        return json({ success: false, message: errorData.error || "Error al sincronizar" });
+        return json({ success: false, intent: "sync", message: errorData.error || "Error al sincronizar" });
       }
     } catch {
-      return json({ success: false, message: "Error de conexión con NCF Manager" });
+      return json({ success: false, intent: "sync", message: "Error de conexión" });
+    }
+  }
+
+  if (intent === "createNCF") {
+    const orderId = formData.get("orderId") as string;
+    const ncfType = formData.get("ncfType") as string;
+    const rnc = formData.get("rnc") as string;
+    const razonSocial = formData.get("razonSocial") as string;
+
+    try {
+      const response = await fetch(`${ncfManagerUrl}/api/shopify/ncf`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Shopify-Shop": shopDomain },
+        body: JSON.stringify({ orderId, ncfType, rnc, razonSocial }),
+      });
+      if (response.ok) {
+        return json({ success: true, intent: "createNCF", message: "NCF creado exitosamente" });
+      } else {
+        const errorData = await response.json().catch(() => ({}));
+        return json({ success: false, intent: "createNCF", message: errorData.error || "Error al crear NCF" });
+      }
+    } catch {
+      return json({ success: false, intent: "createNCF", message: "Error de conexión" });
     }
   }
 
@@ -219,325 +204,278 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function Index() {
-  const { shop, orders, ordersError, ncfManagerUrl } = useLoaderData<typeof loader>();
+  const { shop, orders, ordersError, ordersStats, ncfManagerUrl } = useLoaderData<typeof loader>();
+  const actionData = useActionData<typeof action>();
   const submit = useSubmit();
   const navigation = useNavigation();
-  const isSyncing = navigation.state === "submitting";
+  const isLoading = navigation.state !== "idle";
 
-  // Formatear fecha
+  // Estado para tabs
+  const [selectedTab, setSelectedTab] = useState(0);
+
+  // Estado para modal de NCF
+  const [ncfModalOpen, setNcfModalOpen] = useState(false);
+  const [selectedOrder, setSelectedOrder] = useState<typeof orders[0] | null>(null);
+  const [ncfType, setNcfType] = useState("B02");
+  const [rnc, setRnc] = useState("");
+  const [razonSocial, setRazonSocial] = useState("");
+
+  // Cerrar modal cuando se completa la acción
+  useEffect(() => {
+    if (actionData?.intent === "createNCF" && actionData?.success) {
+      setNcfModalOpen(false);
+      setSelectedOrder(null);
+      setRnc("");
+      setRazonSocial("");
+    }
+  }, [actionData]);
+
+  // IndexTable para órdenes
+  const resourceName = { singular: "orden", plural: "órdenes" };
+  const { selectedResources, allResourcesSelected, handleSelectionChange } = useIndexResourceState(orders);
+
   const formatDate = (dateStr: string) => {
     return new Date(dateStr).toLocaleDateString("es-DO", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
+      day: "2-digit", month: "short", year: "numeric",
     });
   };
 
-  // Formatear precio DOP
   const formatPrice = (amount: number) => {
-    return new Intl.NumberFormat("es-DO", {
-      style: "currency",
-      currency: "DOP",
-    }).format(amount);
+    return new Intl.NumberFormat("es-DO", { style: "currency", currency: "DOP" }).format(amount);
   };
 
-  // Obtener estado del NCF
-  const getNCFStatus = (order: typeof orders[0]) => {
-    if (!order.request) return "Pendiente";
-    if (order.request.status === "SENT") return "Enviado";
-    if (order.request.status === "CONFIRMED") return "Confirmado";
-    return "En proceso";
+  const getNCFBadge = (order: typeof orders[0]) => {
+    if (!order.request) return <Badge tone="attention">Pendiente</Badge>;
+    if (order.request.status === "SENT") return <Badge tone="success">Enviado</Badge>;
+    if (order.request.status === "CONFIRMED") return <Badge tone="info">Confirmado</Badge>;
+    return <Badge>En proceso</Badge>;
   };
 
-  // Preparar filas para DataTable
-  const tableRows = orders.map((order) => [
-    order.orderNumber,
-    formatDate(order.orderDate),
-    order.customerName || "Sin cliente",
-    getNCFStatus(order),
-    formatPrice(order.total),
-  ]);
+  const handleSync = () => submit({ intent: "sync" }, { method: "post" });
 
-  const handleSync = () => {
-    submit({ intent: "sync" }, { method: "post" });
+  const openNCFModal = useCallback((order: typeof orders[0]) => {
+    setSelectedOrder(order);
+    setRazonSocial(order.customerName || "");
+    setNcfModalOpen(true);
+  }, []);
+
+  const handleCreateNCF = () => {
+    if (!selectedOrder) return;
+    submit(
+      { intent: "createNCF", orderId: selectedOrder.id, ncfType, rnc, razonSocial },
+      { method: "post" }
+    );
   };
 
   const isPro = shop.plan === "pro";
   const isNearLimit = shop.usagePercent >= 80;
   const isAtLimit = shop.invoicesThisMonth >= shop.monthlyLimit;
-  // Info de billing centralizado
-  const billingSource = shop.billingSource;
-  const canUpgradeHere = shop.canUpgradeHere;
-  const billingMessage = shop.billingMessage;
-  // Si ya es Pro pero pagó en otra plataforma
-  const paidElsewhere = isPro && billingSource && billingSource !== "shopify";
+
+  // Filas de la tabla de órdenes
+  const rowMarkup = orders.map((order, index) => (
+    <IndexTable.Row id={order.id} key={order.id} position={index} selected={selectedResources.includes(order.id)}>
+      <IndexTable.Cell>
+        <Text variant="bodyMd" fontWeight="bold" as="span">{order.orderNumber}</Text>
+      </IndexTable.Cell>
+      <IndexTable.Cell>{formatDate(order.orderDate)}</IndexTable.Cell>
+      <IndexTable.Cell>{order.customerName || "—"}</IndexTable.Cell>
+      <IndexTable.Cell>{formatPrice(order.total)}</IndexTable.Cell>
+      <IndexTable.Cell>{getNCFBadge(order)}</IndexTable.Cell>
+      <IndexTable.Cell>
+        {!order.request ? (
+          <Button size="slim" onClick={() => openNCFModal(order)}>Crear NCF</Button>
+        ) : (
+          <Button size="slim" variant="plain" url={`${ncfManagerUrl}/solicitudes/${order.request.id}`} external>
+            Ver
+          </Button>
+        )}
+      </IndexTable.Cell>
+    </IndexTable.Row>
+  ));
+
+  // Tabs de navegación
+  const tabs = [
+    { id: "orders", content: "Órdenes", panelID: "orders-panel" },
+    { id: "stats", content: "Resumen", panelID: "stats-panel" },
+  ];
 
   return (
-    <Page title="NCF Manager">
-      <BlockStack gap="500">
-        {/* Banner de límite */}
-        {!isPro && isNearLimit && !isAtLimit && (
-          <Banner
-            title="Cerca del límite mensual"
-            tone="warning"
-          >
-            <p>
-              Has usado {shop.invoicesThisMonth} de {shop.monthlyLimit} comprobantes este mes.
-              Actualiza a Pro para comprobantes ilimitados.
-            </p>
+    <Page
+      title="NCF Manager"
+      primaryAction={
+        <Button icon={RefreshIcon} onClick={handleSync} loading={isLoading}>
+          Sincronizar Shopify
+        </Button>
+      }
+      secondaryActions={[
+        { content: "Abrir Web App", icon: ExternalIcon, url: ncfManagerUrl, external: true },
+      ]}
+    >
+      <BlockStack gap="400">
+        {/* Banners de estado */}
+        {actionData?.message && (
+          <Banner tone={actionData.success ? "success" : "critical"} onDismiss={() => {}}>
+            {actionData.message}
           </Banner>
         )}
 
         {!isPro && isAtLimit && (
-          <Banner
-            title="Límite mensual alcanzado"
-            tone="critical"
-          >
-            <p>
-              Has alcanzado el límite de {shop.monthlyLimit} comprobantes mensuales.
-              Actualiza a Pro ($9/mes) para continuar generando comprobantes.
-            </p>
+          <Banner title="Límite alcanzado" tone="critical">
+            <p>Has alcanzado el límite de {shop.monthlyLimit} comprobantes. Actualiza a Pro para continuar.</p>
           </Banner>
         )}
 
+        {!isPro && isNearLimit && !isAtLimit && (
+          <Banner title="Cerca del límite" tone="warning">
+            <p>Has usado {shop.invoicesThisMonth} de {shop.monthlyLimit} comprobantes este mes.</p>
+          </Banner>
+        )}
+
+        {/* Stats rápidas */}
         <Layout>
-          {/* Columna principal */}
-          <Layout.Section>
-            {/* Stats Cards */}
-            <Card>
-              <BlockStack gap="400">
-                <InlineStack align="space-between">
-                  <Text as="h2" variant="headingMd">
-                    Resumen
-                  </Text>
-                  <Badge tone={isPro ? "success" : "info"}>
-                    {isPro ? "Pro" : "Gratis"}
-                  </Badge>
-                </InlineStack>
-
-                <Divider />
-
-                <InlineStack gap="800" align="start" blockAlign="start">
-                  <BlockStack gap="100">
-                    <Text as="p" variant="bodyMd" tone="subdued">
-                      Comprobantes este mes
-                    </Text>
-                    <Text as="p" variant="headingXl">
-                      {shop.invoicesThisMonth}
-                    </Text>
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      de {shop.monthlyLimit} {isPro ? "(ilimitado)" : ""}
-                    </Text>
-                  </BlockStack>
-
-                  <BlockStack gap="100">
-                    <Text as="p" variant="bodyMd" tone="subdued">
-                      Órdenes recientes
-                    </Text>
-                    <Text as="p" variant="headingXl">
-                      {orders.length}
-                    </Text>
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      últimas 10
-                    </Text>
-                  </BlockStack>
-                </InlineStack>
-
-                {!isPro && (
-                  <Box>
-                    <BlockStack gap="200">
-                      <InlineStack align="space-between">
-                        <Text as="span" variant="bodySm">
-                          Uso mensual
-                        </Text>
-                        <Text as="span" variant="bodySm">
-                          {shop.usagePercent}%
-                        </Text>
-                      </InlineStack>
-                      <ProgressBar
-                        progress={shop.usagePercent}
-                        tone={isNearLimit ? "critical" : "primary"}
-                        size="small"
-                      />
-                    </BlockStack>
-                  </Box>
-                )}
-              </BlockStack>
-            </Card>
-
-            {/* Órdenes recientes */}
-            <Box paddingBlockStart="500">
-              <Card>
-                <BlockStack gap="400">
-                  <InlineStack align="space-between">
-                    <Text as="h2" variant="headingMd">
-                      Órdenes Recientes
-                    </Text>
-                    <Button
-                      onClick={handleSync}
-                      loading={isSyncing}
-                      icon={RefreshIcon}
-                      size="slim"
-                    >
-                      Sincronizar
-                    </Button>
-                  </InlineStack>
-
-                  {ordersError ? (
-                    <Banner tone="warning">
-                      <p>
-                        Para ver tus órdenes, primero sincroniza desde NCF Manager.
-                      </p>
-                    </Banner>
-                  ) : orders.length > 0 ? (
-                    <DataTable
-                      columnContentTypes={["text", "text", "text", "text", "numeric"]}
-                      headings={["Orden", "Fecha", "Cliente", "NCF", "Total"]}
-                      rows={tableRows}
-                    />
-                  ) : (
-                    <EmptyState
-                      heading="Sin órdenes sincronizadas"
-                      image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
-                    >
-                      <p>Sincroniza tus órdenes para comenzar a generar NCFs.</p>
-                    </EmptyState>
-                  )}
-                </BlockStack>
-              </Card>
-            </Box>
-          </Layout.Section>
-
-          {/* Sidebar */}
           <Layout.Section variant="oneThird">
-            {/* Acciones rápidas */}
             <Card>
-              <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">
-                  Acciones
-                </Text>
-
-                <BlockStack gap="300">
-                  <Button
-                    url={ncfManagerUrl}
-                    external
-                    icon={ExternalIcon}
-                    fullWidth
-                  >
-                    Abrir NCF Manager
-                  </Button>
-
-                  <Button
-                    url={`${ncfManagerUrl}/ordenes/nueva`}
-                    external
-                    variant="plain"
-                    fullWidth
-                  >
-                    Crear orden manual
-                  </Button>
-
-                  <Button
-                    url={`${ncfManagerUrl}/solicitudes`}
-                    external
-                    variant="plain"
-                    fullWidth
-                  >
-                    Ver solicitudes
-                  </Button>
-                </BlockStack>
+              <BlockStack gap="200">
+                <Text as="p" variant="bodySm" tone="subdued">Órdenes</Text>
+                <Text as="p" variant="headingLg">{ordersStats.total}</Text>
               </BlockStack>
             </Card>
-
-            {/* Upgrade card - solo si no es Pro o si puede hacer upgrade aquí */}
-            {!isPro && canUpgradeHere && (
-              <Box paddingBlockStart="500">
-                <Card>
-                  <BlockStack gap="400">
-                    <Text as="h2" variant="headingMd">
-                      Actualiza a Pro
-                    </Text>
-
-                    <Text as="p" variant="bodyMd" tone="subdued">
-                      Obtén comprobantes ilimitados por solo $9/mes.
-                    </Text>
-
-                    <BlockStack gap="200">
-                      <Text as="p" variant="bodySm">
-                        ✓ Comprobantes ilimitados
-                      </Text>
-                      <Text as="p" variant="bodySm">
-                        ✓ Sincronización automática
-                      </Text>
-                      <Text as="p" variant="bodySm">
-                        ✓ Soporte prioritario
-                      </Text>
-                    </BlockStack>
-
-                    <Form method="post" action="/app/billing">
-                      <Button variant="primary" fullWidth submit>
-                        Actualizar a Pro - $9/mes
-                      </Button>
-                    </Form>
-                  </BlockStack>
-                </Card>
-              </Box>
-            )}
-
-            {/* Mensaje si ya tiene Pro de otra plataforma */}
-            {paidElsewhere && (
-              <Box paddingBlockStart="500">
-                <Card>
-                  <BlockStack gap="300">
-                    <InlineStack gap="200" align="start">
-                      <Badge tone="success">Pro</Badge>
-                      <Text as="h2" variant="headingMd">
-                        Plan Activo
-                      </Text>
-                    </InlineStack>
-
-                    <Text as="p" variant="bodyMd" tone="subdued">
-                      {billingMessage || `Tu suscripción Pro está activa via ${billingSource === "stripe" ? "la web" : "App Store"}.`}
-                    </Text>
-
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      Puedes gestionar tu suscripción desde {billingSource === "stripe" ? "NCF Manager web" : "la App Store"}.
-                    </Text>
-                  </BlockStack>
-                </Card>
-              </Box>
-            )}
-
-            {/* Info de tienda */}
-            <Box paddingBlockStart="500">
-              <Card>
-                <BlockStack gap="300">
-                  <Text as="h2" variant="headingMd">
-                    Tu tienda
-                  </Text>
-
-                  <BlockStack gap="100">
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      Nombre
-                    </Text>
-                    <Text as="p" variant="bodyMd">
-                      {shop.name}
-                    </Text>
-                  </BlockStack>
-
-                  <BlockStack gap="100">
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      Dominio
-                    </Text>
-                    <Text as="p" variant="bodyMd">
-                      {shop.domain}
-                    </Text>
-                  </BlockStack>
-                </BlockStack>
-              </Card>
-            </Box>
+          </Layout.Section>
+          <Layout.Section variant="oneThird">
+            <Card>
+              <BlockStack gap="200">
+                <Text as="p" variant="bodySm" tone="subdued">Con NCF</Text>
+                <Text as="p" variant="headingLg">{ordersStats.withNCF}</Text>
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+          <Layout.Section variant="oneThird">
+            <Card>
+              <BlockStack gap="200">
+                <Text as="p" variant="bodySm" tone="subdued">Pendientes</Text>
+                <Text as="p" variant="headingLg">{ordersStats.pendingNCF}</Text>
+              </BlockStack>
+            </Card>
           </Layout.Section>
         </Layout>
+
+        {/* Tabs de contenido */}
+        <Card padding="0">
+          <Tabs tabs={tabs} selected={selectedTab} onSelect={setSelectedTab}>
+            <Box padding="400">
+              {selectedTab === 0 && (
+                // Tab de Órdenes
+                ordersError ? (
+                  <Banner tone="warning">
+                    <p>Haz clic en "Sincronizar Shopify" para cargar tus órdenes.</p>
+                  </Banner>
+                ) : orders.length > 0 ? (
+                  <IndexTable
+                    resourceName={resourceName}
+                    itemCount={orders.length}
+                    selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
+                    onSelectionChange={handleSelectionChange}
+                    headings={[
+                      { title: "Orden" },
+                      { title: "Fecha" },
+                      { title: "Cliente" },
+                      { title: "Total" },
+                      { title: "NCF" },
+                      { title: "Acción" },
+                    ]}
+                    selectable={false}
+                  >
+                    {rowMarkup}
+                  </IndexTable>
+                ) : (
+                  <EmptyState
+                    heading="Sin órdenes"
+                    image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
+                    action={{ content: "Sincronizar Shopify", onAction: handleSync }}
+                  >
+                    <p>Sincroniza tus órdenes de Shopify para comenzar.</p>
+                  </EmptyState>
+                )
+              )}
+
+              {selectedTab === 1 && (
+                // Tab de Resumen
+                <BlockStack gap="400">
+                  <InlineStack align="space-between">
+                    <Text as="h2" variant="headingMd">Plan: {isPro ? "Pro" : "Gratis"}</Text>
+                    <Badge tone={isPro ? "success" : "info"}>{isPro ? "Pro" : "Free"}</Badge>
+                  </InlineStack>
+                  <Divider />
+                  <BlockStack gap="200">
+                    <Text as="p" variant="bodyMd">
+                      Comprobantes usados: <strong>{shop.invoicesThisMonth}</strong> de {shop.monthlyLimit}
+                    </Text>
+                    {!isPro && (
+                      <ProgressBar progress={shop.usagePercent} tone={isNearLimit ? "critical" : "primary"} />
+                    )}
+                  </BlockStack>
+                  {!isPro && shop.canUpgradeHere && (
+                    <Box paddingBlockStart="400">
+                      <Form method="post" action="/app/billing">
+                        <Button variant="primary" fullWidth submit>
+                          Actualizar a Pro - $9/mes
+                        </Button>
+                      </Form>
+                    </Box>
+                  )}
+                </BlockStack>
+              )}
+            </Box>
+          </Tabs>
+        </Card>
       </BlockStack>
+
+      {/* Modal para crear NCF */}
+      <Modal
+        open={ncfModalOpen}
+        onClose={() => setNcfModalOpen(false)}
+        title={`Crear NCF - ${selectedOrder?.orderNumber || ""}`}
+        primaryAction={{
+          content: "Crear NCF",
+          onAction: handleCreateNCF,
+          loading: isLoading,
+          disabled: !razonSocial,
+        }}
+        secondaryActions={[{ content: "Cancelar", onAction: () => setNcfModalOpen(false) }]}
+      >
+        <Modal.Section>
+          <FormLayout>
+            <Select
+              label="Tipo de Comprobante"
+              options={NCF_TYPES}
+              value={ncfType}
+              onChange={setNcfType}
+            />
+            <TextField
+              label="RNC/Cédula"
+              value={rnc}
+              onChange={setRnc}
+              placeholder="Opcional para B02"
+              autoComplete="off"
+            />
+            <TextField
+              label="Razón Social / Nombre"
+              value={razonSocial}
+              onChange={setRazonSocial}
+              autoComplete="off"
+              requiredIndicator
+            />
+            {selectedOrder && (
+              <Box padding="200" background="bg-surface-secondary" borderRadius="200">
+                <BlockStack gap="100">
+                  <Text as="p" variant="bodySm">Total: {formatPrice(selectedOrder.total)}</Text>
+                  <Text as="p" variant="bodySm">Cliente: {selectedOrder.customerName}</Text>
+                </BlockStack>
+              </Box>
+            )}
+          </FormLayout>
+        </Modal.Section>
+      </Modal>
     </Page>
   );
 }
