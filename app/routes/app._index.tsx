@@ -117,50 +117,41 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       }
     }
 
-    // Obtener órdenes recientes desde Shopify
-    console.log("Dashboard: Obteniendo órdenes...");
+    // Obtener órdenes desde NCF Manager (tiene el token guardado)
+    console.log("Dashboard: Obteniendo órdenes desde NCF Manager...");
     let orders: Array<{
       id: string;
-      name: string;
-      createdAt: string;
-      displayFinancialStatus: string;
-      displayFulfillmentStatus: string;
-      totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
-      customer: { displayName: string; email: string } | null;
+      orderNumber: string;
+      customerName: string;
+      customerEmail: string | null;
+      total: number;
+      orderDate: string;
+      source: string;
+      request?: { status: string } | null;
     }> = [];
+    let ordersError = false;
 
     try {
-      const ordersResponse = await admin.graphql(`
-        query {
-          orders(first: 10, sortKey: CREATED_AT, reverse: true) {
-            edges {
-              node {
-                id
-                name
-                createdAt
-                displayFinancialStatus
-                displayFulfillmentStatus
-                totalPriceSet {
-                  shopMoney {
-                    amount
-                    currencyCode
-                  }
-                }
-                customer {
-                  displayName
-                  email
-                }
-              }
-            }
-          }
-        }
-      `);
-      const ordersData = await ordersResponse.json();
-      orders = ordersData.data?.orders?.edges?.map((edge: { node: typeof orders[0] }) => edge.node) || [];
-      console.log("Dashboard: Órdenes obtenidas:", orders.length);
+      const ordersResponse = await fetch(`${ncfManagerUrl}/api/shopify/orders?limit=10`, {
+        headers: {
+          "X-Shopify-Shop": shopDomain,
+        },
+      });
+      if (ordersResponse.ok) {
+        const ordersData = await ordersResponse.json();
+        orders = ordersData.orders || [];
+        console.log("Dashboard: Órdenes obtenidas:", orders.length);
+      } else if (ordersResponse.status === 404) {
+        // Shop no tiene órdenes aún - necesita sincronizar
+        console.log("Dashboard: No hay órdenes - necesita sincronizar");
+        ordersError = true;
+      } else {
+        console.error("Error obteniendo órdenes: Status", ordersResponse.status);
+        ordersError = true;
+      }
     } catch (err) {
       console.error("Error obteniendo órdenes:", err);
-      // Continuar sin órdenes
+      ordersError = true;
     }
 
     // Usar datos del plan centralizado (NCF Manager es la fuente de verdad)
@@ -182,6 +173,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         billingMessage: centralPlan.message,
       },
       orders,
+      ordersError,
       ncfManagerUrl,
     });
   } catch (err) {
@@ -203,7 +195,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
 
     try {
-      const response = await fetch(`${ncfManagerUrl}/api/orders/sync`, {
+      const response = await fetch(`${ncfManagerUrl}/api/shopify/orders`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -215,7 +207,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         const data = await response.json();
         return json({ success: true, message: data.message || "Sincronización completada" });
       } else {
-        return json({ success: false, message: "Error al sincronizar" });
+        const errorData = await response.json().catch(() => ({}));
+        return json({ success: false, message: errorData.error || "Error al sincronizar" });
       }
     } catch {
       return json({ success: false, message: "Error de conexión con NCF Manager" });
@@ -226,7 +219,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function Index() {
-  const { shop, orders, ncfManagerUrl } = useLoaderData<typeof loader>();
+  const { shop, orders, ordersError, ncfManagerUrl } = useLoaderData<typeof loader>();
   const submit = useSubmit();
   const navigation = useNavigation();
   const isSyncing = navigation.state === "submitting";
@@ -240,27 +233,29 @@ export default function Index() {
     });
   };
 
-  // Formatear precio
-  const formatPrice = (amount: string, currency: string) => {
+  // Formatear precio DOP
+  const formatPrice = (amount: number) => {
     return new Intl.NumberFormat("es-DO", {
       style: "currency",
-      currency,
-    }).format(parseFloat(amount));
+      currency: "DOP",
+    }).format(amount);
+  };
+
+  // Obtener estado del NCF
+  const getNCFStatus = (order: typeof orders[0]) => {
+    if (!order.request) return "Pendiente";
+    if (order.request.status === "SENT") return "Enviado";
+    if (order.request.status === "CONFIRMED") return "Confirmado";
+    return "En proceso";
   };
 
   // Preparar filas para DataTable
-  const tableRows = orders.map((order: {
-    name: string;
-    createdAt: string;
-    customer: { displayName: string } | null;
-    displayFinancialStatus: string;
-    totalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
-  }) => [
-    order.name,
-    formatDate(order.createdAt),
-    order.customer?.displayName || "Sin cliente",
-    order.displayFinancialStatus,
-    formatPrice(order.totalPriceSet.shopMoney.amount, order.totalPriceSet.shopMoney.currencyCode),
+  const tableRows = orders.map((order) => [
+    order.orderNumber,
+    formatDate(order.orderDate),
+    order.customerName || "Sin cliente",
+    getNCFStatus(order),
+    formatPrice(order.total),
   ]);
 
   const handleSync = () => {
@@ -388,18 +383,24 @@ export default function Index() {
                     </Button>
                   </InlineStack>
 
-                  {orders.length > 0 ? (
+                  {ordersError ? (
+                    <Banner tone="warning">
+                      <p>
+                        Para ver tus órdenes, primero sincroniza desde NCF Manager.
+                      </p>
+                    </Banner>
+                  ) : orders.length > 0 ? (
                     <DataTable
                       columnContentTypes={["text", "text", "text", "text", "numeric"]}
-                      headings={["Orden", "Fecha", "Cliente", "Estado", "Total"]}
+                      headings={["Orden", "Fecha", "Cliente", "NCF", "Total"]}
                       rows={tableRows}
                     />
                   ) : (
                     <EmptyState
-                      heading="Sin órdenes"
+                      heading="Sin órdenes sincronizadas"
                       image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
                     >
-                      <p>Las órdenes de tu tienda aparecerán aquí.</p>
+                      <p>Sincroniza tus órdenes para comenzar a generar NCFs.</p>
                     </EmptyState>
                   )}
                 </BlockStack>
