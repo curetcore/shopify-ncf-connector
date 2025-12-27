@@ -19,15 +19,15 @@ import {
   ProgressBar,
   Divider,
   IndexTable,
-  useIndexResourceState,
   Tabs,
   Modal,
   TextField,
   FormLayout,
   Select,
-  Spinner,
+  InlineGrid,
+  SkeletonBodyText,
 } from "@shopify/polaris";
-import { ExternalIcon, RefreshIcon, PlusIcon } from "@shopify/polaris-icons";
+import { ExternalIcon, RefreshIcon } from "@shopify/polaris-icons";
 
 // Tipos de NCF
 const NCF_TYPES = [
@@ -37,7 +37,44 @@ const NCF_TYPES = [
   { label: "Régimen Especial (B14)", value: "B14" },
 ];
 
-// Loader - Obtiene datos para el dashboard
+// Tipos para los datos
+interface Order {
+  id: string;
+  orderNumber: string;
+  customerName: string;
+  customerEmail: string | null;
+  total: number;
+  orderDate: string;
+  source: string;
+  request?: { id: string; status: string; ncfId: string | null } | null;
+}
+
+interface NCFRecord {
+  id: string;
+  ncfCode: string;
+  orderNumber: string;
+  customerName: string;
+  razonSocial: string;
+  rnc: string;
+  total: number;
+  status: string;
+  createdAt: string;
+}
+
+interface CompanySettings {
+  name: string;
+  rnc: string;
+  address: string | null;
+  phone: string | null;
+  email: string | null;
+}
+
+interface UsageMonth {
+  month: string;
+  count: number;
+}
+
+// Loader - Obtiene todos los datos para el dashboard
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   try {
     const { session, admin } = await authenticate.admin(request);
@@ -46,14 +83,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
     const ncfManagerUrl = process.env.NCF_MANAGER_URL || "https://ncf.curetcore.com";
 
-    // Sincronizar token con NCF Manager (en background)
+    // Sincronizar token con NCF Manager
     fetch(`${ncfManagerUrl}/api/webhooks/shopify/token-sync`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ shop: shopDomain, accessToken }),
     }).catch(() => {});
 
-    // Consultar plan centralizado desde NCF Manager
+    // Consultar plan centralizado
     let centralPlan = {
       plan: "free" as string,
       monthlyLimit: 10,
@@ -72,7 +109,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       }
     } catch {}
 
-    // Obtener o crear Shop en la DB local
+    // Shop local
     let shop = await prisma.shop.findUnique({ where: { shopDomain } });
 
     if (!shop) {
@@ -95,17 +132,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       }
     }
 
-    // Obtener órdenes desde NCF Manager
-    let orders: Array<{
-      id: string;
-      orderNumber: string;
-      customerName: string;
-      customerEmail: string | null;
-      total: number;
-      orderDate: string;
-      source: string;
-      request?: { id: string; status: string; ncfId: string | null } | null;
-    }> = [];
+    // Obtener órdenes
+    let orders: Order[] = [];
     let ordersError = false;
     let ordersStats = { total: 0, withNCF: 0, pendingNCF: 0 };
 
@@ -123,6 +151,42 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     } catch {
       ordersError = true;
     }
+
+    // Obtener historial de NCFs
+    let ncfs: NCFRecord[] = [];
+    try {
+      const ncfsResponse = await fetch(`${ncfManagerUrl}/api/shopify/ncfs?limit=50`, {
+        headers: { "X-Shopify-Shop": shopDomain },
+      });
+      if (ncfsResponse.ok) {
+        const ncfsData = await ncfsResponse.json();
+        ncfs = ncfsData.ncfs || [];
+      }
+    } catch {}
+
+    // Obtener configuración de empresa
+    let company: CompanySettings | null = null;
+    try {
+      const settingsResponse = await fetch(`${ncfManagerUrl}/api/shopify/settings`, {
+        headers: { "X-Shopify-Shop": shopDomain },
+      });
+      if (settingsResponse.ok) {
+        const settingsData = await settingsResponse.json();
+        company = settingsData.company || null;
+      }
+    } catch {}
+
+    // Obtener estadísticas de uso
+    let usageMonths: UsageMonth[] = [];
+    try {
+      const usageResponse = await fetch(`${ncfManagerUrl}/api/shopify/usage`, {
+        headers: { "X-Shopify-Shop": shopDomain },
+      });
+      if (usageResponse.ok) {
+        const usageData = await usageResponse.json();
+        usageMonths = usageData.months || [];
+      }
+    } catch {}
 
     const usagePercent = centralPlan.monthlyLimit > 0
       ? Math.round((centralPlan.invoicesThisMonth / centralPlan.monthlyLimit) * 100)
@@ -143,6 +207,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       orders,
       ordersError,
       ordersStats,
+      ncfs,
+      company,
+      usageMonths,
       ncfManagerUrl,
     });
   } catch (err) {
@@ -151,7 +218,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }
 };
 
-// Action - Manejar sincronización y creación de NCF
+// Action - Manejar sincronización, creación de NCF y configuración
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shopDomain = session.shop;
@@ -200,25 +267,67 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
+  if (intent === "saveCompany") {
+    const name = formData.get("companyName") as string;
+    const rnc = formData.get("companyRnc") as string;
+    const address = formData.get("companyAddress") as string;
+    const phone = formData.get("companyPhone") as string;
+    const email = formData.get("companyEmail") as string;
+
+    try {
+      const response = await fetch(`${ncfManagerUrl}/api/shopify/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Shopify-Shop": shopDomain },
+        body: JSON.stringify({ name, rnc, address, phone, email }),
+      });
+      if (response.ok) {
+        return json({ success: true, intent: "saveCompany", message: "Datos de empresa guardados" });
+      } else {
+        const errorData = await response.json().catch(() => ({}));
+        return json({ success: false, intent: "saveCompany", message: errorData.error || "Error al guardar" });
+      }
+    } catch {
+      return json({ success: false, intent: "saveCompany", message: "Error de conexión" });
+    }
+  }
+
   return json({ success: false, message: "Acción no reconocida" });
 };
 
 export default function Index() {
-  const { shop, orders, ordersError, ordersStats, ncfManagerUrl } = useLoaderData<typeof loader>();
+  const { shop, orders, ordersError, ordersStats, ncfs, company, usageMonths, ncfManagerUrl } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const submit = useSubmit();
   const navigation = useNavigation();
   const isLoading = navigation.state !== "idle";
 
-  // Estado para tabs
+  // Tabs
   const [selectedTab, setSelectedTab] = useState(0);
 
-  // Estado para modal de NCF
+  // Modal NCF
   const [ncfModalOpen, setNcfModalOpen] = useState(false);
-  const [selectedOrder, setSelectedOrder] = useState<typeof orders[0] | null>(null);
+  const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [ncfType, setNcfType] = useState("B02");
   const [rnc, setRnc] = useState("");
   const [razonSocial, setRazonSocial] = useState("");
+
+  // Formulario empresa
+  const [companyName, setCompanyName] = useState(company?.name || "");
+  const [companyRnc, setCompanyRnc] = useState(company?.rnc || "");
+  const [companyAddress, setCompanyAddress] = useState(company?.address || "");
+  const [companyPhone, setCompanyPhone] = useState(company?.phone || "");
+  const [companyEmail, setCompanyEmail] = useState(company?.email || "");
+
+  // Cargar datos de empresa cuando cambie
+  useEffect(() => {
+    if (company) {
+      setCompanyName(company.name || "");
+      setCompanyRnc(company.rnc || "");
+      setCompanyAddress(company.address || "");
+      setCompanyPhone(company.phone || "");
+      setCompanyEmail(company.email || "");
+    }
+  }, [company]);
 
   // Cerrar modal cuando se completa la acción
   useEffect(() => {
@@ -230,10 +339,6 @@ export default function Index() {
     }
   }, [actionData]);
 
-  // IndexTable para órdenes
-  const resourceName = { singular: "orden", plural: "órdenes" };
-  const { selectedResources, allResourcesSelected, handleSelectionChange } = useIndexResourceState(orders);
-
   const formatDate = (dateStr: string) => {
     return new Date(dateStr).toLocaleDateString("es-DO", {
       day: "2-digit", month: "short", year: "numeric",
@@ -244,7 +349,7 @@ export default function Index() {
     return new Intl.NumberFormat("es-DO", { style: "currency", currency: "DOP" }).format(amount);
   };
 
-  const getNCFBadge = (order: typeof orders[0]) => {
+  const getNCFBadge = (order: Order) => {
     if (!order.request) return <Badge tone="attention">Pendiente</Badge>;
     if (order.request.status === "SENT") return <Badge tone="success">Enviado</Badge>;
     if (order.request.status === "CONFIRMED") return <Badge tone="info">Confirmado</Badge>;
@@ -253,7 +358,7 @@ export default function Index() {
 
   const handleSync = () => submit({ intent: "sync" }, { method: "post" });
 
-  const openNCFModal = useCallback((order: typeof orders[0]) => {
+  const openNCFModal = useCallback((order: Order) => {
     setSelectedOrder(order);
     setRazonSocial(order.customerName || "");
     setNcfModalOpen(true);
@@ -267,13 +372,23 @@ export default function Index() {
     );
   };
 
+  const handleSaveCompany = () => {
+    submit(
+      { intent: "saveCompany", companyName, companyRnc, companyAddress, companyPhone, companyEmail },
+      { method: "post" }
+    );
+  };
+
   const isPro = shop.plan === "pro";
   const isNearLimit = shop.usagePercent >= 80;
   const isAtLimit = shop.invoicesThisMonth >= shop.monthlyLimit;
 
-  // Filas de la tabla de órdenes
-  const rowMarkup = orders.map((order, index) => (
-    <IndexTable.Row id={order.id} key={order.id} position={index} selected={selectedResources.includes(order.id)}>
+  // Calcular máximo para el gráfico
+  const maxUsage = Math.max(...usageMonths.map(m => m.count), 1);
+
+  // Filas de órdenes
+  const orderRows = orders.map((order, index) => (
+    <IndexTable.Row id={order.id} key={order.id} position={index}>
       <IndexTable.Cell>
         <Text variant="bodyMd" fontWeight="bold" as="span">{order.orderNumber}</Text>
       </IndexTable.Cell>
@@ -293,9 +408,25 @@ export default function Index() {
     </IndexTable.Row>
   ));
 
-  // Tabs de navegación
+  // Filas de NCFs
+  const ncfRows = ncfs.map((ncf, index) => (
+    <IndexTable.Row id={ncf.id} key={ncf.id} position={index}>
+      <IndexTable.Cell>
+        <Text variant="bodyMd" fontWeight="bold" as="span">{ncf.ncfCode}</Text>
+      </IndexTable.Cell>
+      <IndexTable.Cell>{ncf.orderNumber}</IndexTable.Cell>
+      <IndexTable.Cell>{ncf.razonSocial}</IndexTable.Cell>
+      <IndexTable.Cell>{ncf.rnc}</IndexTable.Cell>
+      <IndexTable.Cell>{formatPrice(ncf.total)}</IndexTable.Cell>
+      <IndexTable.Cell>{formatDate(ncf.createdAt)}</IndexTable.Cell>
+    </IndexTable.Row>
+  ));
+
+  // Tabs
   const tabs = [
-    { id: "orders", content: "Órdenes", panelID: "orders-panel" },
+    { id: "orders", content: `Órdenes (${ordersStats.total})`, panelID: "orders-panel" },
+    { id: "ncfs", content: `NCFs (${ncfs.length})`, panelID: "ncfs-panel" },
+    { id: "company", content: "Empresa", panelID: "company-panel" },
     { id: "stats", content: "Resumen", panelID: "stats-panel" },
   ];
 
@@ -304,15 +435,15 @@ export default function Index() {
       title="NCF Manager"
       primaryAction={
         <Button icon={RefreshIcon} onClick={handleSync} loading={isLoading}>
-          Sincronizar Shopify
+          Sincronizar
         </Button>
       }
       secondaryActions={[
-        { content: "Abrir Web App", icon: ExternalIcon, url: ncfManagerUrl, external: true },
+        { content: "Web App", icon: ExternalIcon, url: ncfManagerUrl, external: true },
       ]}
     >
       <BlockStack gap="400">
-        {/* Banners de estado */}
+        {/* Banners */}
         {actionData?.message && (
           <Banner tone={actionData.success ? "success" : "critical"} onDismiss={() => {}}>
             {actionData.message}
@@ -321,60 +452,58 @@ export default function Index() {
 
         {!isPro && isAtLimit && (
           <Banner title="Límite alcanzado" tone="critical">
-            <p>Has alcanzado el límite de {shop.monthlyLimit} comprobantes. Actualiza a Pro para continuar.</p>
+            <p>Has usado {shop.monthlyLimit} comprobantes. Actualiza a Pro para continuar.</p>
           </Banner>
         )}
 
         {!isPro && isNearLimit && !isAtLimit && (
           <Banner title="Cerca del límite" tone="warning">
-            <p>Has usado {shop.invoicesThisMonth} de {shop.monthlyLimit} comprobantes este mes.</p>
+            <p>Has usado {shop.invoicesThisMonth} de {shop.monthlyLimit} comprobantes.</p>
           </Banner>
         )}
 
         {/* Stats rápidas */}
-        <Layout>
-          <Layout.Section variant="oneThird">
-            <Card>
-              <BlockStack gap="200">
-                <Text as="p" variant="bodySm" tone="subdued">Órdenes</Text>
-                <Text as="p" variant="headingLg">{ordersStats.total}</Text>
-              </BlockStack>
-            </Card>
-          </Layout.Section>
-          <Layout.Section variant="oneThird">
-            <Card>
-              <BlockStack gap="200">
-                <Text as="p" variant="bodySm" tone="subdued">Con NCF</Text>
-                <Text as="p" variant="headingLg">{ordersStats.withNCF}</Text>
-              </BlockStack>
-            </Card>
-          </Layout.Section>
-          <Layout.Section variant="oneThird">
-            <Card>
-              <BlockStack gap="200">
-                <Text as="p" variant="bodySm" tone="subdued">Pendientes</Text>
-                <Text as="p" variant="headingLg">{ordersStats.pendingNCF}</Text>
-              </BlockStack>
-            </Card>
-          </Layout.Section>
-        </Layout>
+        <InlineGrid columns={4} gap="400">
+          <Card>
+            <BlockStack gap="100">
+              <Text as="p" variant="bodySm" tone="subdued">Órdenes</Text>
+              <Text as="p" variant="headingLg">{ordersStats.total}</Text>
+            </BlockStack>
+          </Card>
+          <Card>
+            <BlockStack gap="100">
+              <Text as="p" variant="bodySm" tone="subdued">Con NCF</Text>
+              <Text as="p" variant="headingLg">{ordersStats.withNCF}</Text>
+            </BlockStack>
+          </Card>
+          <Card>
+            <BlockStack gap="100">
+              <Text as="p" variant="bodySm" tone="subdued">Pendientes</Text>
+              <Text as="p" variant="headingLg">{ordersStats.pendingNCF}</Text>
+            </BlockStack>
+          </Card>
+          <Card>
+            <BlockStack gap="100">
+              <Text as="p" variant="bodySm" tone="subdued">Este mes</Text>
+              <Text as="p" variant="headingLg">{shop.invoicesThisMonth}/{shop.monthlyLimit}</Text>
+            </BlockStack>
+          </Card>
+        </InlineGrid>
 
         {/* Tabs de contenido */}
         <Card padding="0">
           <Tabs tabs={tabs} selected={selectedTab} onSelect={setSelectedTab}>
             <Box padding="400">
+              {/* Tab: Órdenes */}
               {selectedTab === 0 && (
-                // Tab de Órdenes
                 ordersError ? (
                   <Banner tone="warning">
-                    <p>Haz clic en "Sincronizar Shopify" para cargar tus órdenes.</p>
+                    <p>Haz clic en "Sincronizar" para cargar tus órdenes de Shopify.</p>
                   </Banner>
                 ) : orders.length > 0 ? (
                   <IndexTable
-                    resourceName={resourceName}
+                    resourceName={{ singular: "orden", plural: "órdenes" }}
                     itemCount={orders.length}
-                    selectedItemsCount={allResourcesSelected ? "All" : selectedResources.length}
-                    onSelectionChange={handleSelectionChange}
                     headings={[
                       { title: "Orden" },
                       { title: "Fecha" },
@@ -385,7 +514,7 @@ export default function Index() {
                     ]}
                     selectable={false}
                   >
-                    {rowMarkup}
+                    {orderRows}
                   </IndexTable>
                 ) : (
                   <EmptyState
@@ -393,19 +522,101 @@ export default function Index() {
                     image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
                     action={{ content: "Sincronizar Shopify", onAction: handleSync }}
                   >
-                    <p>Sincroniza tus órdenes de Shopify para comenzar.</p>
+                    <p>Sincroniza tus órdenes para comenzar.</p>
                   </EmptyState>
                 )
               )}
 
+              {/* Tab: NCFs */}
               {selectedTab === 1 && (
-                // Tab de Resumen
+                ncfs.length > 0 ? (
+                  <IndexTable
+                    resourceName={{ singular: "NCF", plural: "NCFs" }}
+                    itemCount={ncfs.length}
+                    headings={[
+                      { title: "NCF" },
+                      { title: "Orden" },
+                      { title: "Razón Social" },
+                      { title: "RNC" },
+                      { title: "Total" },
+                      { title: "Fecha" },
+                    ]}
+                    selectable={false}
+                  >
+                    {ncfRows}
+                  </IndexTable>
+                ) : (
+                  <EmptyState
+                    heading="Sin comprobantes"
+                    image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
+                  >
+                    <p>Aún no has creado comprobantes fiscales.</p>
+                  </EmptyState>
+                )
+              )}
+
+              {/* Tab: Empresa */}
+              {selectedTab === 2 && (
                 <BlockStack gap="400">
+                  <Text as="h2" variant="headingMd">Datos Fiscales de la Empresa</Text>
+                  <FormLayout>
+                    <FormLayout.Group>
+                      <TextField
+                        label="Nombre de la Empresa"
+                        value={companyName}
+                        onChange={setCompanyName}
+                        autoComplete="organization"
+                        requiredIndicator
+                      />
+                      <TextField
+                        label="RNC"
+                        value={companyRnc}
+                        onChange={setCompanyRnc}
+                        autoComplete="off"
+                        placeholder="000000000"
+                        requiredIndicator
+                      />
+                    </FormLayout.Group>
+                    <TextField
+                      label="Dirección"
+                      value={companyAddress}
+                      onChange={setCompanyAddress}
+                      autoComplete="street-address"
+                    />
+                    <FormLayout.Group>
+                      <TextField
+                        label="Teléfono"
+                        value={companyPhone}
+                        onChange={setCompanyPhone}
+                        autoComplete="tel"
+                      />
+                      <TextField
+                        label="Email"
+                        value={companyEmail}
+                        onChange={setCompanyEmail}
+                        autoComplete="email"
+                        type="email"
+                      />
+                    </FormLayout.Group>
+                  </FormLayout>
+                  <InlineStack align="end">
+                    <Button variant="primary" onClick={handleSaveCompany} loading={isLoading}>
+                      Guardar Datos
+                    </Button>
+                  </InlineStack>
+                </BlockStack>
+              )}
+
+              {/* Tab: Resumen */}
+              {selectedTab === 3 && (
+                <BlockStack gap="400">
+                  {/* Plan y uso */}
                   <InlineStack align="space-between">
                     <Text as="h2" variant="headingMd">Plan: {isPro ? "Pro" : "Gratis"}</Text>
                     <Badge tone={isPro ? "success" : "info"}>{isPro ? "Pro" : "Free"}</Badge>
                   </InlineStack>
                   <Divider />
+
                   <BlockStack gap="200">
                     <Text as="p" variant="bodyMd">
                       Comprobantes usados: <strong>{shop.invoicesThisMonth}</strong> de {shop.monthlyLimit}
@@ -414,13 +625,46 @@ export default function Index() {
                       <ProgressBar progress={shop.usagePercent} tone={isNearLimit ? "critical" : "primary"} />
                     )}
                   </BlockStack>
+
+                  {/* Gráfico de uso mensual */}
+                  {usageMonths.length > 0 && (
+                    <BlockStack gap="200">
+                      <Text as="h3" variant="headingSm">Uso por mes</Text>
+                      <Box paddingBlockStart="200">
+                        <InlineStack gap="200" align="start" blockAlign="end">
+                          {usageMonths.map((month, i) => (
+                            <BlockStack key={i} gap="100" inlineAlign="center">
+                              <Box
+                                background={month.count > 0 ? "bg-fill-info" : "bg-surface-secondary"}
+                                borderRadius="100"
+                                minHeight={`${Math.max((month.count / maxUsage) * 100, 10)}px`}
+                                minWidth="40px"
+                              />
+                              <Text as="span" variant="bodySm" tone="subdued">{month.month}</Text>
+                              <Text as="span" variant="bodySm" fontWeight="semibold">{month.count}</Text>
+                            </BlockStack>
+                          ))}
+                        </InlineStack>
+                      </Box>
+                    </BlockStack>
+                  )}
+
+                  {/* Upgrade */}
                   {!isPro && shop.canUpgradeHere && (
                     <Box paddingBlockStart="400">
-                      <Form method="post" action="/app/billing">
-                        <Button variant="primary" fullWidth submit>
-                          Actualizar a Pro - $9/mes
-                        </Button>
-                      </Form>
+                      <Card>
+                        <BlockStack gap="200">
+                          <Text as="h3" variant="headingSm">Actualiza a Pro</Text>
+                          <Text as="p" variant="bodySm" tone="subdued">
+                            Comprobantes ilimitados, soporte prioritario y más.
+                          </Text>
+                          <Form method="post" action="/app/billing">
+                            <Button variant="primary" fullWidth submit>
+                              Actualizar - $9/mes
+                            </Button>
+                          </Form>
+                        </BlockStack>
+                      </Card>
                     </Box>
                   )}
                 </BlockStack>
