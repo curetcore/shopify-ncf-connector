@@ -44,13 +44,35 @@ shopify-ncf-connector/
 
 ## Dashboard (app._index.tsx)
 
-El dashboard embebido incluye:
-- **Resumen**: Stats de comprobantes y órdenes
-- **Barra de progreso**: Uso mensual del plan gratuito
-- **Tabla de órdenes**: Últimas 10 órdenes de Shopify
-- **Acciones**: Links a NCF Manager completo
-- **Upgrade**: Card para actualizar a Pro ($9/mes)
-- **Info de tienda**: Nombre y dominio
+Dashboard completo con 4 tabs y stats en tiempo real:
+
+### Stats Cards (Header)
+- **Órdenes**: Total de órdenes sincronizadas
+- **Con NCF**: Órdenes con comprobante asignado
+- **Pendientes**: Órdenes sin comprobante
+- **Este mes**: Uso vs límite mensual
+
+### Tab 1: Órdenes
+- Tabla con órdenes de Shopify (IndexTable)
+- Columnas: Orden, Fecha, Cliente, Total, NCF, Acción
+- Botón "Crear NCF" abre modal con formulario
+- Badge de estado (Pendiente, En proceso, Enviado, Confirmado)
+
+### Tab 2: NCFs (Historial)
+- Historial de comprobantes creados
+- Columnas: NCF, Orden, Razón Social, RNC, Total, Fecha
+- Consume endpoint `/api/shopify/ncfs` de NCF Manager
+
+### Tab 3: Empresa (Configuración)
+- Formulario de datos fiscales
+- Campos: Nombre, RNC, Dirección, Teléfono, Email
+- Guarda en NCF Manager via `/api/shopify/settings`
+
+### Tab 4: Resumen
+- Plan actual (Free/Pro) con badge
+- ProgressBar de uso mensual
+- Gráfico de barras de uso por mes (últimos 6 meses)
+- Card de upgrade a Pro ($9/mes)
 
 ## Modelos de Base de Datos
 
@@ -131,9 +153,21 @@ shopify app deploy --force
 
 ## Sincronización con NCF Manager
 
-El token de Shopify se sincroniza automáticamente cuando el merchant accede al dashboard:
-- Endpoint: `NCF_MANAGER_URL/api/webhooks/shopify/token-sync`
-- Permite a NCF Manager hacer queries a Shopify en nombre de la tienda
+El token de Shopify se sincroniza automáticamente cuando el merchant accede al dashboard.
+
+### Endpoints Consumidos
+
+| Endpoint | Método | Uso |
+|----------|--------|-----|
+| `/api/webhooks/shopify/token-sync` | POST | Sincronizar token de acceso |
+| `/api/shop/plan` | GET | Obtener plan y límites |
+| `/api/shopify/orders` | GET/POST | Listar/Sincronizar órdenes |
+| `/api/shopify/ncf` | POST | Crear comprobante NCF |
+| `/api/shopify/ncfs` | GET | Historial de comprobantes |
+| `/api/shopify/settings` | GET/POST | Configuración de empresa |
+| `/api/shopify/usage` | GET | Estadísticas de uso mensual |
+
+Todos los endpoints usan header `X-Shopify-Shop` para identificar la tienda.
 
 ## Notas
 
